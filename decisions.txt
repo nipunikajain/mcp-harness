@@ -1,0 +1,254 @@
+DECISION LOG — mcp-harness
+Append-only. Newest entries at the bottom.
+Format is defined in CLAUDE.md §1. No credentials or secrets in this file.
+
+================================================================================
+2026-09-30 — Adopt a documented learning workflow (decisions.txt,
+              EXECUTION_FLOW.md, understanding checks)
+================================================================================
+
+PROBLEM / REQUIREMENT
+  This repo is a learning harness for the MCP Python SDK, not just a deliverable.
+  Sessions were leaving no trace of *why* things were built a certain way, and no
+  description of how the code actually executes. Future sessions (and the author)
+  had to re-derive both from scratch.
+
+APPROACH CHOSEN, AND WHY
+  Three artifacts, each with one job:
+    - CLAUDE.md        — the process itself, auto-loaded into every session, so
+                         the workflow survives context loss.
+    - decisions.txt    — why (append-only rationale log).
+    - EXECUTION_FLOW.md— how (runtime behavior, kept aligned with real code).
+  Plus a pre/post review gate: state purpose+approach+tradeoff before a major
+  change, then quiz on it afterward before it counts as accepted.
+  Separating "why" from "how" keeps each file short enough to actually be read
+  and updated. CLAUDE.md is the chosen home for the process because Claude Code
+  loads it automatically — no session has to be told the rules exist.
+
+ALTERNATIVES CONSIDERED
+  - A single README covering everything. Rejected: rationale and runtime docs
+    change on different cadences and get skimmed differently; one file would rot.
+  - Git commit messages as the decision log. Rejected: this directory is not a
+    git repository, and commit messages are not readable as a single narrative.
+  - Docstrings/inline comments only. Rejected: they cannot carry rejected
+    alternatives or cross-file architectural tradeoffs.
+
+TRADEOFFS / LIMITATIONS
+  - Real overhead per meaningful change; mitigated by explicitly exempting
+    routine fixes.
+  - These files are maintained by hand and can drift from the code. Nothing
+    enforces alignment — EXECUTION_FLOW.md is only as true as the last update.
+  - The understanding check deliberately slows delivery. That is the point here,
+    but it is the wrong default for a pure shipping project.
+
+RELEVANT FILES / FUNCTIONS
+  CLAUDE.md (new), decisions.txt (new), EXECUTION_FLOW.md (new).
+  No application code touched: server.py and client.py are unchanged.
+
+DEPENDENCIES
+  None added. Documentation only.
+
+================================================================================
+2026-09-30 — Replace the in-process dict with an HTTP call to a simulated
+              order API
+================================================================================
+
+PROBLEM / REQUIREMENT
+  First end-to-end prototype: an agent asks "status of order 1042?", the MCP
+  server answers from a real order API over HTTP. The dict lookup in
+  server.py:ORDERS had no network boundary and therefore no realistic failure
+  modes — it could not distinguish "no such order" from "the system is down",
+  because it could never be down.
+
+APPROACH CHOSEN, AND WHY
+  - order_api.py: a separate Starlette+uvicorn service on :8001, explicitly
+    labelled a SIMULATED business API, holding the fictional fixtures.
+    GET /orders/{id} -> 200 with the order, or 404 for unknown.
+  - server.py:get_order_status became async and now issues an HTTP GET.
+  - OrderStatus (pydantic BaseModel) is the explicit output model.
+  - The central distinction: the API ANSWERING "no such order" (404) is a normal
+    result -> OrderStatus(found=False), is_error false. The API NOT answering
+    (connect error, timeout, 5xx, non-JSON) raises OrderAPIUnavailable ->
+    is_error true. Rule: a returned OrderStatus means the API answered; an
+    exception means we do not know.
+  - OrderAPIUnavailable subclasses the SDK's ToolError, not Exception, so the
+    reason reaches the agent. Verified: a plain Exception is treated as a crash
+    and the client sees only "Error executing tool get_order_status", with the
+    real text kept server-side.
+  - Config via env: ORDER_API_BASE_URL (default http://127.0.0.1:8001) and
+    ORDER_API_TIMEOUT_SECONDS (default 5.0). A timeout is set explicitly because
+    httpx's default would let a hung API stall the agent indefinitely.
+
+ALTERNATIVES CONSIDERED
+  - Returning found=False on connection failure. Rejected: it tells the agent
+    the order does not exist, which is a confident false statement. Acceptance
+    scenario 4 exists precisely to forbid this.
+  - Returning an in-band {"error": ...} dict instead of raising. Rejected: the
+    MCP result would carry is_error=false, so the agent has no protocol-level
+    signal that the call failed.
+  - Raising plain Exception. Rejected after testing: the SDK classifies it as a
+    crash and withholds the message from the agent.
+  - Adding the API to server.py as a second route on one process. Rejected: no
+    real network boundary, which is the point of the milestone.
+  - FastAPI for the simulated API. Rejected: not installed, and Starlette (which
+    ships with mcp) already covers two routes. No new dependency needed.
+  - A module-level shared httpx2.AsyncClient. Rejected for now: per-call clients
+    are simpler and correctness-neutral here. Revisit if per-request connection
+    setup ever matters.
+
+TRADEOFFS / LIMITATIONS
+  - The harness now needs TWO processes running. Ordering matters at request
+    time, not startup time.
+  - get_order_status is now I/O-bound with real failure modes.
+  - A per-call AsyncClient means a new connection per request — fine at this
+    scale, wasteful at volume.
+  - The timeout, non-200-non-404, and non-JSON branches are implemented but
+    NOT exercised by checks.py. They are inspected, not verified.
+
+DEPENDENCIES
+  No new installs — all four were already present in .venv as transitive deps of
+  mcp. But the project now imports them DIRECTLY, so requirements.txt declares
+  them explicitly rather than leaning on mcp's dependency tree:
+    httpx2 2.12.0   — async HTTP client. Chosen because it was already present
+                      and is async-native; the stdlib's urllib is blocking and
+                      would stall the event loop inside an async tool. `requests`
+                      is not installed and has the same blocking problem.
+    starlette 1.6.0 — two routes and a JSON response; already present via mcp.
+    uvicorn 0.53.0  — ASGI server for the above; already present via mcp.
+    pydantic 2.13.5 — the OrderStatus output model; already present via mcp.
+
+RELEVANT FILES / FUNCTIONS
+  order_api.py:get_order, order_api.py:ORDERS (new, simulated fixtures)
+  server.py:get_order_status, server.py:OrderStatus, server.py:OrderAPIUnavailable
+  checks.py:main (four acceptance scenarios), checks.py:payload_of
+  requirements.txt, README.md (new)
+  client.py unchanged; server.py's old ORDERS dict removed.
+
+================================================================================
+2026-09-30 — checks.py binds its own ports and refuses occupied ones
+================================================================================
+
+PROBLEM / REQUIREMENT
+  The first run of checks.py reported 4/5 passing. Those passes were FALSE. A
+  stale MCP server from 09:27, still holding port 8000, was running the old
+  dict-based code. checks.py's own server failed to bind, but its readiness
+  probe saw the stale listener and connected to it. Every assertion was
+  satisfied by code that had been replaced.
+
+APPROACH CHOSEN, AND WHY
+  - checks.py uses ports 8010/8011, not 8000/8001, so a dev server left running
+    does not collide with it.
+  - A pre-flight guard aborts if either port is already occupied, rather than
+    connecting to whatever happens to be there.
+  - Readiness polling now also fails fast if the subprocess has already exited.
+  - The MCP server is started via server.mcp.run_streamable_http_async(port=...)
+    because the `mcp run` CLI exposes no port flag (verified: `mcp run --help`
+    lists only --transport).
+
+ALTERNATIVES CONSIDERED
+  - Killing whatever occupies 8000. Rejected: that process belongs to the user,
+    not to the checks.
+  - Keeping 8000/8001 and just asserting they are free. Rejected: it would make
+    the checks unrunnable while a dev server is up, which is the normal case.
+
+TRADEOFFS / LIMITATIONS
+  - checks.py exercises run_streamable_http_async directly, whereas the
+    documented manual command is `mcp run`. Same server object and transport,
+    different entry point — so `mcp run` itself is not covered by the checks.
+
+RELEVANT FILES / FUNCTIONS
+  checks.py:main, checks.py:port_is_free, checks.py:wait_for_port
+
+================================================================================
+2026-09-30 — Reframe: the product is an agent-assisted MCP server builder;
+              define the integration contract (Milestone 1)
+================================================================================
+
+PROBLEM / REQUIREMENT
+  The order example had taken over the project. The actual goal is a product
+  that lets someone supply an API specification and a task, have a builder
+  agent propose MCP tools, review them, generate and test the integration, and
+  run it on a reusable MCP server. server.py fused all three concerns (runtime,
+  HTTP/error policy, order-specific tool) and offered nothing a second
+  integration -- or a code-generating builder -- could conform to.
+
+APPROACH CHOSEN, AND WHY
+  Three components with hard boundaries (docs/ARCHITECTURE.md): harness (no
+  domain knowledge), integrations (manifest + typed handlers), builder (later).
+  Milestone 1 ships only the contract, harness/contract.py, before any runtime:
+  - Integration = manifest + Python handlers. The manifest is reviewed
+    metadata (identity, tool names/descriptions, handler refs, required
+    settings, read-only declaration); handlers are tested code. This is what
+    the builder will emit: a proposal maps onto the manifest, generation fills
+    in handlers.
+  - Schemas are NOT in the manifest. The typed handler signature is the single
+    source of truth; the SDK derives input/output schemas from it (already
+    verified in server.py). The injected `api` parameter will be stripped by
+    the loader.
+  - One handler-reference format, "<module>:<function>" relative to the
+    integration package. One format means one resolver and no ambiguity for
+    the generator.
+  - behavior.read_only is typed Literal[True]. Writes are out of scope for
+    release 1 and there is deliberately no override to turn them on.
+  - Secrets are named as settings and may not carry defaults; values come from
+    configuration, never from integration files.
+  - Unknown keys are rejected (extra="forbid") so a generated manifest with a
+    typo fails rather than silently losing a field.
+  - validate_manifest re-shapes pydantic errors into one line per problem,
+    each naming the field path, so builder and human can act on them.
+  - Two reference manifests, orders and a fictional weather_lookup, so the
+    contract is tested against an unrelated domain, a secret setting and a
+    multi-tool integration -- not just orders.
+
+ALTERNATIVES CONSIDERED
+  - Fully declarative integrations (JSON/YAML mapping tool -> endpoint, one
+    generic handler). Easiest to review, but cannot express one tool
+    coordinating several endpoints or reshaping responses without an escape
+    hatch, and the escape hatch becomes the real contract.
+  - Python-only, register via decorator, no manifest. Simplest now, but leaves
+    nothing reviewable separate from code and nothing for the builder's
+    analysis stage to output before generation.
+  - Auto-discovering every package under integrations/. Rejected: a freshly
+    generated, unreviewed integration would go live on next start. Loading is
+    config-gated (Milestone 2).
+  - Putting input/output schemas in the manifest for reviewability. Rejected:
+    two sources of truth that drift; reviewers can read the typed signature.
+
+TRADEOFFS / LIMITATIONS
+  - The contract is derived from one real integration and one toy. It may
+    still be orders-shaped in ways we cannot see; Milestone 7's unrelated API
+    is the real test.
+  - Pydantic runs the manifest-level cross-field validator only when every
+    field validated. If a child field is bad, the "base_url_setting not
+    declared" and "duplicate tool names" errors are not reported in the same
+    pass -- a builder may need two rounds. Observed, accepted for now.
+  - Handler rules are documented but not enforced until the loader exists
+    (Milestone 2). The orders manifest points at handlers.py, which does not
+    exist until Milestone 3; Milestone 1 validates data, not imports.
+  - read_only is a reviewed declaration, not a runtime guarantee or a sandbox.
+
+RELEVANT FILES / FUNCTIONS
+  harness/contract.py: IntegrationManifest, ToolSpec, ToolBehavior,
+    SettingSpec, UpstreamSpec, validate_manifest, InvalidManifest
+  integrations/orders/manifest.py, integrations/examples/weather_lookup/manifest.py
+  tests/test_contract.py (14 tests), docs/ARCHITECTURE.md, docs/ROADMAP.md
+  server.py, order_api.py, checks.py, client.py untouched (checks still 5/5).
+
+DEPENDENCIES
+  None added. pydantic (already a direct dependency) and stdlib unittest.
+  pytest was considered and rejected for now: unittest covers 14 tests with
+  zero install; revisit if fixtures get painful in Milestone 3+.
+
+--------------------------------------------------------------------------------
+2026-09-30 — ACCEPTED: Milestone 1 (integration contract) and the earlier
+              HTTP-backed order lookup, after the understanding check.
+--------------------------------------------------------------------------------
+  Quiz covered: validation vs startup vs request-time failures; schemas
+  derive from the handler signature, not the manifest; read_only is a
+  reviewed claim, not a runtime guard; secrets never carry defaults;
+  ToolError vs Exception. Technical evidence: tests 14/14, checks.py 5/5.
+  Nothing committed (not yet a git repository; that is Milestone 8 territory,
+  or earlier if the user chooses).
+  Process note for future sessions: quiz questions must reference files that
+  exist today, not planned milestones — forward references confused rather
+  than tested.

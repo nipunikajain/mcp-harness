@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local configuration and secrets -- never commit real values.
+.env
+.env.*
+harness.toml
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Claude Code: per-machine permission allowlist. Project instructions live in CLAUDE.md (tracked).
+.claude/settings.local.json

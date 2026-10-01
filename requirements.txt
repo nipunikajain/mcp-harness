@@ -1,0 +1,12 @@
+# Direct dependencies only. Pinned to what is installed in .venv and verified
+# working on 2026-09-30 (Python 3.11.0).
+#
+# starlette, uvicorn, pydantic and httpx2 all arrive transitively with mcp, but
+# this project imports each of them directly, so they are declared explicitly
+# rather than relied on as transitive extras.
+
+mcp==2.2.0            # MCP server + client SDK
+httpx2==2.12.0        # async HTTP client; server.py calls the order API
+starlette==1.6.0      # ASGI framework for the simulated order API
+uvicorn==0.53.0       # ASGI server that runs the simulated order API
+pydantic==2.13.5      # OrderStatus output model
